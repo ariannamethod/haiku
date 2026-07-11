@@ -1,6 +1,6 @@
 # haiku — a small alien in one C file. libc + -lm, nothing else.
 CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wextra
+CFLAGS  ?= -O2 -Wall -Wextra -pthread
 LDLIBS  ?= -lm
 
 haiku: haiku.c

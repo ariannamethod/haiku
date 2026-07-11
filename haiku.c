@@ -31,6 +31,7 @@
 #include <math.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <pthread.h>
 
 /* ── 6 emotional chambers (the body) ─────────────────────────────── */
 enum { CH_FEAR=0, CH_LOVE, CH_RAGE, CH_VOID, CH_FLOW, CH_COMPLEX, NCH };
@@ -503,36 +504,111 @@ static int syl_sum(const Poem *pm, int line){
 #define MASS_MAX 2.0f
 #define MASS_MIN 0.1f
 #define STATE_MAGIC 0x484B5531u  /* "HKU1" */
-static void init_mass(Body *b){ for(int i=0;i<NCLOUD;i++) b->mass[i]=CLOUD[i].mass; }
-static void morph(Body *b, const Poem *pm){
+
+/* the canonical memory (word masses) — shared with the background worker, guarded
+ * by one mutex. The answer path never reads this in its hot loop: it snapshots into
+ * Body.mass once per turn, so generation stays lock-free and deterministic. */
+static struct { float mass[NCLOUD]; pthread_mutex_t lock; } g_mem;
+
+static void init_mass(void){ for(int i=0;i<NCLOUD;i++) g_mem.mass[i]=CLOUD[i].mass; }
+static void morph(const Poem *pm){
     char hit[NCLOUD]; memset(hit,0,sizeof(hit));
     for(int i=0;i<pm->nw;i++) hit[pm->w[i]]=1;
+    pthread_mutex_lock(&g_mem.lock);
     for(int w=0;w<NCLOUD;w++)
-        b->mass[w] = clampf(b->mass[w] * (hit[w]?1.1f:0.99f), MASS_MIN, MASS_MAX);
+        g_mem.mass[w] = clampf(g_mem.mass[w] * (hit[w]?1.1f:0.99f), MASS_MIN, MASS_MAX);
+    pthread_mutex_unlock(&g_mem.lock);
 }
 /* returns 1 if a valid state was carried in (magic + NCLOUD must match — a changed
  * cloud silently invalidates old memory rather than mis-mapping it). */
-static int load_state(Body *b, const char *path){
+static int load_state(const char *path){
     FILE *f=fopen(path,"rb"); if(!f) return 0;
     uint32_t magic=0; int nc=0; int ok=0;
     if(fread(&magic,sizeof(magic),1,f)==1 && magic==STATE_MAGIC &&
        fread(&nc,sizeof(nc),1,f)==1 && nc==NCLOUD){
         float tmp[NCLOUD];
         if(fread(tmp,sizeof(float),NCLOUD,f)==(size_t)NCLOUD){
-            for(int i=0;i<NCLOUD;i++) b->mass[i]=clampf(tmp[i],MASS_MIN,MASS_MAX); ok=1;
+            pthread_mutex_lock(&g_mem.lock);
+            for(int i=0;i<NCLOUD;i++) g_mem.mass[i]=clampf(tmp[i],MASS_MIN,MASS_MAX);
+            pthread_mutex_unlock(&g_mem.lock); ok=1;
         }
     }
     fclose(f); return ok;
 }
-static void save_state(const Body *b, const char *path){
+static void save_state(const char *path){
+    float snap[NCLOUD];
+    pthread_mutex_lock(&g_mem.lock); memcpy(snap,g_mem.mass,sizeof(snap)); pthread_mutex_unlock(&g_mem.lock);
     char tmp[512]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
     FILE *f=fopen(tmp,"wb"); if(!f) return;
     uint32_t magic=STATE_MAGIC; int nc=NCLOUD;
     fwrite(&magic,sizeof(magic),1,f);
     fwrite(&nc,sizeof(nc),1,f);
-    fwrite(b->mass,sizeof(float),NCLOUD,f);
+    fwrite(snap,sizeof(float),NCLOUD,f);
     fclose(f);
     rename(tmp,path);   /* atomic swap (Leo's tmp+rename) */
+}
+
+/* ── the background worker: one pthread, a bounded queue, drain on exit ──
+ * after each answer the spoken line is enqueued (non-blocking — a full queue drops
+ * the task, the answer never waits). The worker re-hears the line as an echo-ring:
+ * words that RESONATE with what was just said (but weren't spoken) gain a little
+ * mass — associative drift, python's overthinking rings in miniature. Its effect
+ * lands on FUTURE turns, so it never perturbs the current (snapshot) answer. */
+#define QCAP 8
+typedef struct { int w[48]; int nw; } EchoTask;
+static struct {
+    EchoTask q[QCAP];
+    int head, tail, count, stop, running;
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;
+    pthread_t       thread;
+} g_bg;
+
+static void echo_apply(const EchoTask *t){
+    float e[NCH]={0,0,0,0,0,0};
+    char spoken[NCLOUD]; memset(spoken,0,sizeof(spoken));
+    for(int i=0;i<t->nw;i++){ spoken[t->w[i]]=1; for(int c=0;c<NCH;c++) e[c]+=CLOUD[t->w[i]].aff[c]; }
+    pthread_mutex_lock(&g_mem.lock);
+    for(int w=0; w<NCLOUD; w++){
+        if(spoken[w]) continue;
+        if(cosine(e, CLOUD[w].aff, NCH) > 0.6f)
+            g_mem.mass[w] = clampf(g_mem.mass[w]*1.02f, MASS_MIN, MASS_MAX);
+    }
+    pthread_mutex_unlock(&g_mem.lock);
+}
+static void *bg_worker(void *arg){
+    (void)arg;
+    for(;;){
+        pthread_mutex_lock(&g_bg.lock);
+        while(g_bg.count==0 && !g_bg.stop) pthread_cond_wait(&g_bg.cond,&g_bg.lock);
+        if(g_bg.count==0 && g_bg.stop){ pthread_mutex_unlock(&g_bg.lock); break; }
+        EchoTask t = g_bg.q[g_bg.head];
+        g_bg.head=(g_bg.head+1)%QCAP; g_bg.count--;
+        pthread_mutex_unlock(&g_bg.lock);
+        echo_apply(&t);          /* drains: processes even after stop while count>0 */
+    }
+    return NULL;
+}
+static void bg_enqueue(const Poem *pm){
+    pthread_mutex_lock(&g_bg.lock);
+    if(g_bg.count < QCAP){                 /* full queue = drop; the answer never waits */
+        EchoTask *t=&g_bg.q[g_bg.tail];
+        t->nw = pm->nw<48 ? pm->nw : 48;
+        for(int i=0;i<t->nw;i++) t->w[i]=pm->w[i];
+        g_bg.tail=(g_bg.tail+1)%QCAP; g_bg.count++;
+        pthread_cond_signal(&g_bg.cond);
+    }
+    pthread_mutex_unlock(&g_bg.lock);
+}
+static void bg_start(void){
+    pthread_mutex_init(&g_bg.lock,NULL); pthread_cond_init(&g_bg.cond,NULL);
+    g_bg.head=g_bg.tail=g_bg.count=g_bg.stop=0;
+    if(pthread_create(&g_bg.thread,NULL,bg_worker,NULL)==0) g_bg.running=1;
+}
+static void bg_stop(void){                 /* drain the queue, then join */
+    if(!g_bg.running) return;
+    pthread_mutex_lock(&g_bg.lock); g_bg.stop=1; pthread_cond_signal(&g_bg.cond); pthread_mutex_unlock(&g_bg.lock);
+    pthread_join(g_bg.thread,NULL); g_bg.running=0;
 }
 
 int main(int argc, char **argv){
@@ -541,13 +617,16 @@ int main(int argc, char **argv){
     b.rng = seed ? seed : 1;
     for(int c=0;c<NCH;c++) b.ch[c]=0.2f;
     b.temp=0.9f;
-    init_mass(&b);
+    pthread_mutex_init(&g_mem.lock, NULL);
+    init_mass();
     const char *state_path = "haiku.state";
-    int use_state = (getenv("HAIKU_NO_STATE")==NULL);
-    int carried = use_state ? load_state(&b, state_path) : 0;
+    int use_state  = (getenv("HAIKU_NO_STATE")==NULL);
+    int use_async  = (getenv("HAIKU_NO_ASYNC")==NULL);
+    int carried    = use_state ? load_state(state_path) : 0;
+    if(use_async) bg_start();
 
-    printf("haiku — a small alien. seed=%llu  cloud=%d words  forms=%d  memory=%s\n",
-           (unsigned long long)seed, NCLOUD, NFORMS, carried?"carried":"fresh");
+    printf("haiku — a small alien. seed=%llu  cloud=%d words  forms=%d  memory=%s  async=%s\n",
+           (unsigned long long)seed, NCLOUD, NFORMS, carried?"carried":"fresh", use_async?"on":"off");
     printf("speak to it; it answers from its body, in a form its body chooses. /quit to leave.\n\n");
 
     char line[1024];
@@ -560,6 +639,8 @@ int main(int argc, char **argv){
 
         inhale(&b, line);
         float T_in = b.temp;
+        /* snapshot the canonical memory once → generation is lock-free & deterministic */
+        pthread_mutex_lock(&g_mem.lock); memcpy(b.mass, g_mem.mass, sizeof(b.mass)); pthread_mutex_unlock(&g_mem.lock);
         Poem p; speak(&b, &p);
 
         int dom=0; for(int c=1;c<NCH;c++) if(b.ch[c]>b.ch[dom]) dom=c;
@@ -575,9 +656,12 @@ int main(int argc, char **argv){
         /* T must be unchanged by the form organ (heat is the load-bearing wall) */
         if(b.temp != T_in) printf("  !! T moved %.3f -> %.3f (form organ cooled — bug)\n", T_in, b.temp);
         printf("\n");
-        morph(&b, &p);                        /* remember what was just spoken */
-        if(use_state) save_state(&b, state_path);
+        morph(&p);                            /* remember what was just spoken (writes canonical) */
+        if(use_async) bg_enqueue(&p);         /* let the echo-ring drift the memory in the background */
+        if(use_state) save_state(state_path);
     }
+    bg_stop();                                /* drain the background queue, then join */
+    if(use_state) save_state(state_path);     /* final memory, including any drained drift */
     printf("gone.\n");
     return 0;
 }

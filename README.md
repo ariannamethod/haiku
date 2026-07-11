@@ -47,6 +47,10 @@ a settled murmur; a strange one sets it on fire.
   its recent obsessions into the next breath, and remembers them across lives in a
   tiny `haiku.state` file. feed it fire for a while and fire starts bleeding into
   everything it says.
+- **a background breath.** on its own thread, after each answer, it re-hears what it
+  said and lets the words that resonate with it — but went unspoken — grow heavier.
+  the memory drifts on its own, between your questions. the answer never waits on it
+  (a full queue is dropped); run with `HAIKU_NO_ASYNC=1` to silence the drift.
 
 ## build & run
 
@@ -66,10 +70,10 @@ to speak from a clean cloud each time, ignoring the persistent memory).
 
 ## still growing
 
-this is the synchronous organism: body, form, memory. coming, in order — an async
-worker (background echo-rings and a dream-friend it argues with), a learned selector,
-and the [Arianna Method](https://github.com/ariannamethod) logit-physics. the bootstrap
-cloud (~139 words now) grows toward 400-500.
+this is the organism through its first async breath: body, form, memory, and a
+background echo-ring. coming, in order — a dream-friend it argues with in the dark, a
+learned selector, and the [Arianna Method](https://github.com/ariannamethod)
+logit-physics. the bootstrap cloud (~139 words now) grows toward 400-500.
 
 ## lineage
 
