@@ -51,6 +51,10 @@ a settled murmur; a strange one sets it on fire.
   said and lets the words that resonate with it — but went unspoken — grow heavier.
   the memory drifts on its own, between your questions. the answer never waits on it
   (a full queue is dropped); run with `HAIKU_NO_ASYNC=1` to silence the drift.
+- **a dream-friend.** every third breath a second body — its own seed, its own drift —
+  hears what was said and dreams a reply, arguing with itself in the dark. its dreams
+  never reach you, but the words it dreams grow heavier, so the friend's imagination
+  bleeds, faintly, into what the organism says next. (`HAIKU_SHOW_DREAMS=1` to watch it.)
 
 ## build & run
 
@@ -70,10 +74,10 @@ to speak from a clean cloud each time, ignoring the persistent memory).
 
 ## still growing
 
-this is the organism through its first async breath: body, form, memory, and a
-background echo-ring. coming, in order — a dream-friend it argues with in the dark, a
-learned selector, and the [Arianna Method](https://github.com/ariannamethod)
-logit-physics. the bootstrap cloud (~139 words now) grows toward 400-500.
+the organism now breathes on its own: body, form, memory, a background echo-ring, and
+a dream-friend it argues with in the dark. coming, in order — a learned selector, and
+the [Arianna Method](https://github.com/ariannamethod) logit-physics. the bootstrap
+cloud (~139 words now) grows toward 400-500.
 
 ## lineage
 

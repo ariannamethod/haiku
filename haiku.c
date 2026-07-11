@@ -555,16 +555,18 @@ static void save_state(const char *path){
  * mass — associative drift, python's overthinking rings in miniature. Its effect
  * lands on FUTURE turns, so it never perturbs the current (snapshot) answer. */
 #define QCAP 8
-typedef struct { int w[48]; int nw; } EchoTask;
+#define KIND_ECHO  0
+#define KIND_DREAM 1
+typedef struct { int kind; int w[48]; int nw; } Task;
 static struct {
-    EchoTask q[QCAP];
+    Task q[QCAP];
     int head, tail, count, stop, running;
     pthread_mutex_t lock;
     pthread_cond_t  cond;
     pthread_t       thread;
 } g_bg;
 
-static void echo_apply(const EchoTask *t){
+static void echo_apply(const Task *t){
     float e[NCH]={0,0,0,0,0,0};
     char spoken[NCLOUD]; memset(spoken,0,sizeof(spoken));
     for(int i=0;i<t->nw;i++){ spoken[t->w[i]]=1; for(int c=0;c<NCH;c++) e[c]+=CLOUD[t->w[i]].aff[c]; }
@@ -576,23 +578,65 @@ static void echo_apply(const EchoTask *t){
     }
     pthread_mutex_unlock(&g_mem.lock);
 }
+
+/* ── the dream-friend: a distinct organism, touched only by the worker thread ──
+ * it has its own seed and its own drifting body, so it is a genuinely different
+ * voice. it hears what was said and dreams a reply (arguing with itself for a round
+ * or two); the words it dreams gain a little mass in the shared memory. the friend
+ * thinks in the dark, and its dreams bleed, faintly, into what the organism will say. */
+static Body g_friend;
+static int  g_show_dreams;   /* HAIKU_SHOW_DREAMS → print the friend's dreams to stderr */
+
+static void build_line(char *dst, size_t cap, const int *w, int nw){
+    size_t p=0; dst[0]='\0';
+    for(int i=0;i<nw;i++){ int l=(int)strlen(CLOUD[w[i]].w);
+        if(p+(size_t)l+1>=cap) break;
+        memcpy(dst+p, CLOUD[w[i]].w, l); dst[p+l]=' '; p+=l+1; }
+    if(p>0) dst[p-1]='\0';
+}
+static void dream_apply(const Task *t){
+    pthread_mutex_lock(&g_mem.lock);
+    memcpy(g_friend.mass, g_mem.mass, sizeof(g_friend.mass));
+    pthread_mutex_unlock(&g_mem.lock);
+    char heard[512]; build_line(heard, sizeof(heard), t->w, t->nw);
+    for(int round=0; round<2 && heard[0]; round++){
+        inhale(&g_friend, heard);
+        Poem dp; speak(&g_friend, &dp);
+        pthread_mutex_lock(&g_mem.lock);
+        for(int i=0;i<dp.nw;i++)
+            g_mem.mass[dp.w[i]] = clampf(g_mem.mass[dp.w[i]]*1.02f, MASS_MIN, MASS_MAX);
+        pthread_mutex_unlock(&g_mem.lock);
+        if(g_show_dreams){
+            fprintf(stderr, "  [friend dreams] ");
+            int idx=0;
+            for(int l=0;l<dp.nlines;l++){
+                for(int k=0;k<dp.line_len[l];k++,idx++) fprintf(stderr,"%s%s", k?" ":"", CLOUD[dp.w[idx]].w);
+                fprintf(stderr, l<dp.nlines-1 ? " / " : "");
+            }
+            fprintf(stderr, "\n");
+        }
+        build_line(heard, sizeof(heard), dp.w, dp.nw);   /* next round: hear its own dream */
+    }
+}
 static void *bg_worker(void *arg){
     (void)arg;
     for(;;){
         pthread_mutex_lock(&g_bg.lock);
         while(g_bg.count==0 && !g_bg.stop) pthread_cond_wait(&g_bg.cond,&g_bg.lock);
         if(g_bg.count==0 && g_bg.stop){ pthread_mutex_unlock(&g_bg.lock); break; }
-        EchoTask t = g_bg.q[g_bg.head];
+        Task t = g_bg.q[g_bg.head];
         g_bg.head=(g_bg.head+1)%QCAP; g_bg.count--;
         pthread_mutex_unlock(&g_bg.lock);
-        echo_apply(&t);          /* drains: processes even after stop while count>0 */
+        if(t.kind==KIND_DREAM) dream_apply(&t);   /* drains: processes even after stop while count>0 */
+        else                   echo_apply(&t);
     }
     return NULL;
 }
-static void bg_enqueue(const Poem *pm){
+static void bg_enqueue(int kind, const Poem *pm){
     pthread_mutex_lock(&g_bg.lock);
     if(g_bg.count < QCAP){                 /* full queue = drop; the answer never waits */
-        EchoTask *t=&g_bg.q[g_bg.tail];
+        Task *t=&g_bg.q[g_bg.tail];
+        t->kind = kind;
         t->nw = pm->nw<48 ? pm->nw : 48;
         for(int i=0;i<t->nw;i++) t->w[i]=pm->w[i];
         g_bg.tail=(g_bg.tail+1)%QCAP; g_bg.count++;
@@ -623,6 +667,13 @@ int main(int argc, char **argv){
     int use_state  = (getenv("HAIKU_NO_STATE")==NULL);
     int use_async  = (getenv("HAIKU_NO_ASYNC")==NULL);
     int carried    = use_state ? load_state(state_path) : 0;
+    /* the dream-friend: a distinct seed and its own faint body */
+    memset(&g_friend, 0, sizeof(g_friend));
+    g_friend.rng = (seed ? seed : 1) ^ 0x9E3779B97F4A7C15ULL;
+    for(int c=0;c<NCH;c++) g_friend.ch[c]=0.2f;
+    g_friend.temp = 0.9f;
+    g_show_dreams = (getenv("HAIKU_SHOW_DREAMS")!=NULL);
+    int turn = 0;
     if(use_async) bg_start();
 
     printf("haiku — a small alien. seed=%llu  cloud=%d words  forms=%d  memory=%s  async=%s\n",
@@ -657,7 +708,10 @@ int main(int argc, char **argv){
         if(b.temp != T_in) printf("  !! T moved %.3f -> %.3f (form organ cooled — bug)\n", T_in, b.temp);
         printf("\n");
         morph(&p);                            /* remember what was just spoken (writes canonical) */
-        if(use_async) bg_enqueue(&p);         /* let the echo-ring drift the memory in the background */
+        if(use_async){
+            bg_enqueue(KIND_ECHO, &p);        /* echo-ring drifts memory in the background */
+            if((++turn % 3)==0) bg_enqueue(KIND_DREAM, &p);  /* every third breath, the friend dreams */
+        }
         if(use_state) save_state(state_path);
     }
     bg_stop();                                /* drain the background queue, then join */
