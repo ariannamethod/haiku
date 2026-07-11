@@ -1,0 +1,15 @@
+# reference clones (their own repos / the python original) — not part of haiku
+harmonix/
+haiku_c/
+reffs/
+
+# build artifacts & runtime memory
+haiku
+*.o
+*.state
+*.state.tmp
+
+# local design notes & donor (not shipped)
+PROJECT_LOG.md
+FABLE_PLAN_*.md
+donor_partial_*.c
